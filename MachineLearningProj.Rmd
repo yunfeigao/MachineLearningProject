@@ -1,0 +1,284 @@
+---
+title: "Weight Lifting Exercise Performance Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Summary**
+
+With preprocessing and analyzing the weight lifting exercise dataset from the human activity recognition (HAR) research, we create models that can predict the manner (how well) in which the exercise is performed based on many input variables with accuracy up to 98%. We are able to predict correctly 18 out of 20 test cases with the model. 
+
+## **Initial Data Analysis**
+### Background of the Research
+Using the activity tracking devices, such as *Fitbit* and *Jawbone* nowadays gives us a convenient way to collect a large amount of data about personal activity relatively inexpensively. They have traditionally focused on discriminating between different activities, i.e. to predict "which" activity was performed at a specific point in time. But rarely do people quantify **how well they do it**. 
+
+In this work, the dataset is all about the manner in which the weight lifting exercise is performed. There are four sensors mounted on the participants' glove(forearm), arm, belt and dumbbell that can sense the acceleration, gyroscope and magnetometer data along the three-axes x, y and z. The features are extracted in a sliding window ranging from 0.5s to 2.5s, with the representation in Euler angles (roll, pitch and yaw) as well as the raw  accelerometer, gyroscope and magnetometer readings. 
+
+The Participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.
+
+### Dataset Overview
+Two datasets are provided for this project: *training set* (<https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>)
+and *testing set* (<https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv>)
+
+We download and load them in:
+```{r load in data}
+training <- read.csv("pml-training.csv")
+predicting <- read.csv("pml-testing.csv")
+```
+
+The initial examination shows the dimension and structure of the dataset:
+```{r dim and str}
+dim(training)
+dim(predicting)
+str(training, list.len=20)
+```
+
+The `training` set is the one we should use to build and test our model. It has 19622 measured samples and 160 features, the last of which, '`classe`', represents how well the exercise is performed and is the `output` that the model should predict. It's a factor with five values A~E: 
+```{r training output}
+table(training$classe)
+```
+
+The 20 cases in the `predicting` set are the ones we need to predict with our models. 
+
+
+## **Data Preprocess**
+### Remove NA
+One thing we notice from the structure of the data is that there are both empty entry " " and NA in the datasets. We should first convert the "" into NA so we can treat the NA with either imputation or elimination.
+```{r to NA}
+training[training==""] <-NA
+```
+
+If there are too many NAs in a predictor, it may as well be not important in predicting the outcome. We set the cutoff at **70% of the total samples number** and delete the predictors that have NAs more than the cutoff value.
+```{r delete NA}
+NAcut <- round(0.7*nrow(training))
+training_noNA <- training[, colSums(is.na(training))<=NAcut]
+sum(colSums(is.na(training_noNA))) # don't need impute
+```
+
+The final command above just shows that there is no NA left in the training and therefore no need to perform the imputation.
+
+### Zero or Low Variance Predictors
+The next thing we do is the check whether there are predictors with values of low or even zero variance. The following code will detect the zero variance (as we set the parameters so that the "zero variance" criteria is not stringent)
+```{r zero variance}
+library(lattice)
+library(ggplot2)
+library(caret)
+remove_cols <- nearZeroVar(training_noNA, names=TRUE, freqCut=19, uniqueCut=10)
+remove_cols
+trainingSmall <- training_noNA[, setdiff(names(training_noNA), remove_cols)]
+table(training_noNA$new_window)
+```
+
+As we can see that there is only one "zero variance" predictor, which still have two values "yes" and "no". If we make the criteria more stringent on the `nearZeroVar` function by adjusting `freqCut` and `uniqueCut`, we can detect more "low variance" predictors:
+
+```{r low variance}
+remove_cols <- nearZeroVar(training_noNA, names=TRUE, freqCut=2, uniqueCut=20)
+remove_cols
+```
+
+These "low variance" predictors still have some information inside so we don't want to delete all of them. Instead we will keep them and use the Principle Component Analysis to convert them into useful data.
+
+### Collinear Predictors
+After removing the NA and zero variance predictors, we still have 58 input features in our dataset, which leave us wonder if any of them are collinear. In order to investigate the collinearity between the predictors, we first convert all the `integer` into `numeric` and then calculate the correlation matrix. Please note that we leave out the first 6 columns in the `trainingSmall` dataset because they are either in `factor` format or don't necessarily contain measurement information from the sensors.
+```{r collinear}
+trainingSmall[, 7:58]<-sapply(trainingSmall[, 7:58], as.numeric)
+corM <- cor(trainingSmall[, 7:58])
+```
+
+As there are 52 variables in the `corM` matrix, we just take a look at the collinearity between the first one `roll_belt` and all others predictors. We only output the correlation with absolute value larger than 0.9:
+```{r corM}
+which(abs(corM[, 1])>0.8)
+```
+
+We plot out the `roll_belt` vs `yaw_belt`, `total_accel_belt`, `accel_belt_y` and `accel_belt_z`:
+```{r plots}
+par(mfrow=c(2,2), oma=c(0,0,2,0))
+plot(trainingSmall$roll_belt, training$yaw_belt)
+plot(trainingSmall$roll_belt, training$total_accel_belt)
+plot(trainingSmall$roll_belt, training$accel_belt_y)
+plot(trainingSmall$roll_belt, trainingSmall$accel_belt_z)
+```
+
+There are some visible collinearity between the plotted predictors. However, we still opt to keep all of them and use the Principle Component Analysis to convert them into orthogonal components that carry all the useful information.
+
+## **Model Building**
+After preprocessing, we now have a dataset `trainingSmall` that have 19622 samples and 59 features, with the last column being the outcome and the 1~58 columns the predictors. The first thing we do to build the model is to **split the data into training set and testing set**:
+
+```{r data split}
+set.seed(100)
+inTrain <- createDataPartition(y=trainingSmall$classe, p=0.75, list=FALSE)
+train <- trainingSmall[inTrain, ]
+test <- trainingSmall[-inTrain, ]
+prop.table(table(train$classe))/prop.table(table(trainingSmall$classe))
+```
+
+The last command is the confirm that after data splitting, the ratio of each `classe` outcome remain almost unchange, which gives us confidence that this split is fair.
+
+
+The second thing we do is to **build a reusable `trainControl` module** that can be used for multiple models that we build.
+```{r trainControl}
+set.seed(40)
+myControl <- trainControl(
+        method = "cv", number = 5, repeats = 5,
+        classProbs = TRUE, 
+        verboseIter = FALSE
+        )
+```
+
+We choose to use the *5X5 cross validation*, as it strikes the balance bewteen the model accuracy and simulation time. As a matter of fact, we've also tested the model with other cross valication such as *10-folds CV* and *leave one out CV*, and the *5X5 CV* we use here provide almost the same model accuracy.
+
+In order to find the best model, we pick the following four models that are generally used for classification problems: 1. Generalized Linear model with Elastic Net (`glmnet`), 2. Linear Discriminant Analysis (`lda`), 3. Conditional Inference Tree (`ctree`), and 4. Random Forest (`ranger`). We also use the `caret` package to train the model, as it provides a very similar interface for all four model training and very convinient to use.
+
+### Generalized Linear model with Elastic Net (glmnet)
+We will start the model building with the `glmnet` model. It's a generalized linear model for logistic regression, yet it can also be used for the multiclass classification problems. It penalizes linear and logistic regression models on the size and number of coefficients to help prevent overfitting. There are two coefficients that can be tuned, `alpha` and `lambda`, with `alpha` being the switch between the `Lasso` and `Ridge` regression, and `lambda` the penalizing coefficient.
+```{r hide warning, echo=FALSE}
+options(warn = -1)
+```
+
+```{r glmnet, message=FALSE}
+model_glmnet <- train(classe~., train,
+                   method="glmnet",
+                   metric="ROC",
+                   tuneGrid = expand.grid(
+                           alpha = 0:1,
+                           lambda = 0:10/10
+                   ),
+                   trControl=myControl,
+                   preProcess=c("zv", "center", "scale", "pca")
+                   )
+```
+
+```{r glmnet plot}
+plot(model_glmnet)
+```
+
+The plot shows that with `alpha=0` and `lambda=0`, the model has the highest accuracy on the `train` set, at ~80%. The `caret` will train a best model automatically.
+
+In the `preProcess` we specify the model to perform the *zero variance removal*, *center and scale* the predictors and most importantly, the **principle component analysis**, which will (1) convert the collinear predictors into orthogonal ones, and (2) merge the low variance predictor with other to make use of its information.
+
+The prediction is made with the trained model `model_glmnet` on the test dataset `test`. The output is the factor which bears the highest probability among the five.
+```{r predict glmnet}
+pred_glmnet <- predict(model_glmnet, newdata = test, type="raw")
+```
+
+The metric we use to evaluate the model is the accuracy, which we calculate as the **number of correct prediction in test dataset, out of the total number of samples in test dataset**.
+
+```{r glmnet accuracy and confusionMatrix}
+Acc_glmnet <- sum(pred_glmnet==test$classe)/nrow(test)
+round(Acc_glmnet, 3)
+M_glmnet <- confusionMatrix(pred_glmnet, test$classe)
+round(prop.table(M_glmnet$table, 2), 3)
+```
+
+**The "glmnet" model can correctly predict 80.9% of the outcomes in the test set**. To further break it down, the confusion matrix in the percentage form shows when the outcomes of the class is A, B, C, D and E, the model gets it right with the percentages of 91.6%, 68.2%, 82.9%, 67.9% and 87.6%, respectively. This is also called the sensitivity of the model. We can see that it's a little bit low for Class B and D.
+
+
+### Linear Discriminant Analysis (lda)
+The second model is `lda`, which is designed for the multiclasss classification problem. We first train the model with the `train` dataset under `caret`.
+```{r lda model, message=FALSE}
+model_lda <- train(classe~., train,
+                     method="lda",
+                     metric="ROC",
+                     trControl=myControl,
+                     preProcess=c("zv", "center", "scale", "pca")
+)
+pred_lda <- predict(model_lda, newdata = test, type="raw")
+```
+
+The model is used to predict the same set of test data, and just like the `glmnet` model, the accuracy and sensitivity are calculated: 
+```{r lda accuracy and confusionMatrix}
+Acc_lda <- sum(pred_lda==test$classe)/nrow(test)
+round(Acc_lda, 3)
+M_lda <- confusionMatrix(pred_lda, test$classe)
+round(prop.table(M_lda$table, 2), 3)
+```
+
+**The "lda" model has a slightly higher accuracy of 83.9%** - the percentage of the correct prediction out of all the test outcomes. The sensivity for Class A to E are 88%, 81.7%, 82.6%, 73% and 90.9%. It's a not a bad model compared to the `glmnet`.
+
+
+### Conditional Inference Tree (ctree)
+Another model we try is `ctree`. It's a tree based classification model like `rpart`, but it uses a significance test procedure in order to select variables instead of selecting the variable that maximizes an information measure.  
+```{r ctree, message=FALSE}
+model_ctree <- train(classe~., train,
+                  method="ctree",
+                  metric="ROC",
+                  trControl=myControl,
+                  preProcess=c("zv", "center", "scale", "pca")
+                  )
+pred_ctree <- predict(model_ctree, newdata = test, type="raw")
+```
+
+The same `trainControl` and `preProcess` are used as in `glmnet` for fair comparison, and the prediction `pred_ctree` is made base on the `model_ctree` on the test dataset. The *accuracy* result and the *confusion matrix* are calcualted below:
+```{r ctree accuracy and confusionMatrix}
+Acc_ctree <- sum(pred_ctree==test$classe)/nrow(test)
+round(Acc_ctree, 3)
+M_ctree <- confusionMatrix(pred_ctree, test$classe)
+round(prop.table(M_ctree$table, 2), 3)
+```
+
+**The "mtree" model shows a 87.9% total accuracy** and its sensitivity on Class A to Class E are 94.1%, 84.8%, 82.2%, 84.7% and 90% respectively. Those are the percentages at which the model get it right when it's actually the case. This is a more accurate model than the `glmnet` and `lda`.
+
+
+### Random Forest (ranger)
+The last model we train is the `ranger`, the random forest model in `caret`. Random forest model usually give very accurate prediction, but the simulation time may be a little longer than other models. We set up the model training just like the previous three in `caret`, and make prediction on the test data:
+```{r hide warning2, echo=FALSE}
+options(warn = -1)
+```
+
+```{r randomforest, message=FALSE}
+model_rf <- train(classe~., train,
+                  method="ranger",
+                  metric="ROC",
+                  trControl=myControl,
+                  preProcess=c("zv", "center", "scale", "pca")
+)
+pred_rf <- predict(model_rf, newdata = test, type="raw")
+```
+
+The accuracy and sensitivity are calculated below, just like the other methods:
+```{r ranger accuracy and confusionMatrix}
+Acc_rf <- sum(pred_rf==test$classe)/nrow(test)
+round(Acc_rf, 3)
+M_rf <- confusionMatrix(pred_rf, test$classe)
+round(prop.table(M_rf$table, 2), 3)
+```
+
+**The "ranger" model give an very high accuracy of 98.6%**, and the sensitivity for each class is also very high, being 99.5%, 98.4%, 97.3%, 98.1% and 99.1% for Class A to E. 
+
+The following plot is the normalized confusion matrix that show the sensitivity of model `ranger`.
+```{r confusion matrix plot, echo=FALSE}
+library(ggplot2)
+Actual <- factor(c(rep("A", 5), rep("B", 5), rep("C", 5), rep("D", 5), rep("E", 5)))
+Predict <- factor(rep(c("A", "B", "C", "D", "E"), 5))
+dfM<-as.data.frame.matrix(round(prop.table(M_rf$table, 2), 3))
+Y <- c(dfM[, 1], dfM[, 2], dfM[, 3], dfM[, 4], dfM[, 5])
+df <- data.frame(Actual, Predict, Y)
+ggplot(data =  df, mapping = aes(x = Actual, y = Predict)) +
+        geom_tile(aes(fill = Y), colour = "white") +
+        geom_text(aes(label = sprintf("%0.3f", Y)), vjust = 1) +
+        scale_fill_gradient(low = "#66E8F9", high = "#66B3F9") +
+        theme_bw() + theme(legend.position = "none") 
+```
+
+### Comparing Models
+Now we have the four models built with the same cross validation, we will put them together and compare.
+
+```{r model compare}
+model_list <- list(glmnet=model_glmnet, lda=model_lda, ctree=model_ctree, rf=model_rf)
+resamples <- resamples(model_list)
+summary(resamples)
+```
+
+We can see that the random forest model has the highest accuracy and Kappa values, which is also shown in the following Box and Whisker plot:
+
+```{r bwplot}
+bwplot(resamples, metric="Accuracy")
+```
+
+## **Conclusion**
+We build four classification models with `glmnet`, `lda`, `ctree` and `ranger` methods in `caret`, to fit and weight lifting exercise data. The model is used to predict how well the exercise is performed based on many motion sensors inputs. When testing the models on the test dataset to cross check the model, The random forest model `ranger` can achieve 98% accuracy and is the best model among the four. When using the model to make prediction on the predict data set, 18 out of 20 outcomes can be accurately predicted (as in the project quiz in the Practice Machine Learning course).
+
+
